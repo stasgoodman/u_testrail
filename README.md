@@ -1,5 +1,5 @@
 # u_testrail
 
 
-
-print('2Inserted line')
+def normalize_text():
+  print('2Inserted line')
