@@ -1,0 +1,97 @@
+import ast
+import json
+import os
+import tempfile
+from pathlib import Path
+from typing import Optional
+import typer
+from git import Repo
+from github import Github
+
+app = typer.Typer(help="Function usage counter across repos")
+
+def extract_attr_chain(node):
+    names = []
+    while isinstance(node, ast.Attribute):
+        names.insert(0, node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        names.insert(0, node.id)
+    return names
+
+class UsageVisitor(ast.NodeVisitor):
+    def __init__(self, counts):
+        self.counts = counts
+
+    def visit_Call(self, node):
+        fname_chain = extract_attr_chain(node.func)
+        for name in fname_chain:
+            if name in self.counts:
+                self.counts[name] += 1
+        self.generic_visit(node)
+
+def count_usages_in_file(file_path: Path, counts: dict):
+    try:
+        source = file_path.read_text(encoding="utf-8")
+    except Exception:
+        return  # Skip unreadable files
+    if any(s in source for s in ["#", "\"", "'''"]):
+        source = strip_comments(source)
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return
+    UsageVisitor(counts).visit(tree)
+
+def strip_comments(code: str) -> str:
+    # Removes comments and docstrings using AST
+    try:
+        parsed = ast.parse(code)
+        for node in ast.walk(parsed):
+            if isinstance(node, (ast.FunctionDef, ast.ClassDef, ast.Module)):
+                if hasattr(node, 'body') and node.body and isinstance(node.body[0], ast.Expr):
+                    if isinstance(node.body[0].value, ast.Str):
+                        node.body[0] = ast.Pass()
+        return ast.unparse(parsed)
+    except Exception:
+        return code
+
+def clone_repo_to_temp(repo_url: str, token: str) -> Optional[Path]:
+    temp_dir = Path(tempfile.mkdtemp())
+    url = f"https://{token}:x-oauth-basic@github.com/{repo_url}.git"
+    try:
+        Repo.clone_from(url, temp_dir)
+        return temp_dir
+    except Exception:
+        return None
+
+@app.command()
+def count_usage_from_file(
+    input_file: Path = typer.Argument(..., help="JSON input with repos, folder, and functions to count")
+):
+    data = json.loads(input_file.read_text())
+    repos = data["repos"]
+    folder = data.get("folder", "")
+    counts = {fn: 0 for fn in data["counts"]}
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        raise typer.BadParameter("Missing GITHUB_TOKEN env variable")
+
+    for repo in repos:
+        typer.echo(f"\n🔍 Scanning repo: {repo}")
+        path = clone_repo_to_temp(repo, token)
+        if not path:
+            typer.echo(f"❌ Failed to clone: {repo}")
+            continue
+        target_dir = path / folder
+        for pyfile in target_dir.rglob("*.py"):
+            count_usages_in_file(pyfile, counts)
+
+    for fn, count in counts.items():
+        typer.echo(f"{fn}: {count}")
+    data["counts"] = counts
+    input_file.write_text(json.dumps(data, indent=2))
+    typer.echo(f"\n✅ Updated counts saved to {input_file}")
+
+if __name__ == "__main__":
+    app()
