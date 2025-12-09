@@ -82,3 +82,43 @@ def edit_file(
                 console.print(f"[yellow]⚠️ No PR created for {repo.full_name}[/yellow]")
         except Exception as e:
             console.print(f"[red]❌ Failed editing {repo.full_name}:[/red] {e}")
+
+
+from github.Repository import Repository
+from github.PullRequest import PullRequest
+
+def find_or_create_pr(
+    repo: Repository,
+    branch: str,
+    title: str,
+    body: str,
+) -> Optional[PullRequest]:
+    """
+    Find an existing PR from the specified branch or create a new one.
+
+    Args:
+        repo (Repository): PyGithub repo object.
+        branch (str): The head branch for the PR.
+        title (str): Title for the PR if it needs to be created.
+        body (str): Body/description for the PR.
+
+    Returns:
+        PullRequest or None
+    """
+    # Look for open PRs from the same branch
+    pulls = repo.get_pulls(state="open", head=f"{repo.owner.login}:{branch}")
+    for pr in pulls:
+        if pr.head.ref == branch:
+            return pr  # Reuse existing PR
+
+    # Otherwise create new PR
+    try:
+        return repo.create_pull(
+            title=title,
+            body=body,
+            head=branch,
+            base=repo.default_branch,
+        )
+    except Exception as e:
+        console.print(f"[red]❌ Failed to create PR for {repo.full_name}:[/red] {e}")
+        return None
