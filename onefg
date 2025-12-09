@@ -1,121 +1,98 @@
+import ast
 import json
-import re
-import tokenize
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Union
 import typer
-from git import Repo
-from github import Github
 from rich.console import Console
 
 app = typer.Typer()
 console = Console()
 
+EXCLUDED_LOGGER_NAMES = {"logger", "logging"}
 
-def is_in_comment_or_logger(line: str) -> bool:
-    # Check if the line is a comment or logger usage
-    stripped = line.strip()
-    return stripped.startswith("#") or "logger." in stripped or "log." in stripped
+class FunctionUsageCounter(ast.NodeVisitor):
+    def __init__(self, target_funcs: List[str]) -> None:
+        self.target_funcs = set(target_funcs)
+        self.counts = {func: 0 for func in target_funcs}
+
+    def visit_Call(self, node: ast.Call) -> None:
+        func_name = self._resolve_func_name(node.func)
+        if func_name in self.target_funcs:
+            self.counts[func_name] += 1
+        self.generic_visit(node)
+
+    def _resolve_func_name(self, node: ast.AST) -> Union[str, None]:
+        # Handles obj.get_d() and get_d()
+        if isinstance(node, ast.Name):
+            return node.id
+        elif isinstance(node, ast.Attribute):
+            return node.attr
+        return None
+
+    def visit_Expr(self, node: ast.Expr) -> None:
+        # Skip logging calls
+        if isinstance(node.value, ast.Call):
+            func = node.value.func
+            if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+                if func.value.id in EXCLUDED_LOGGER_NAMES:
+                    return  # Skip logger calls
+        self.generic_visit(node)
+
+    def visit_Str(self, node):
+        pass  # skip string literals
+
+    def visit_Constant(self, node):
+        if isinstance(node.value, str):
+            return  # skip docstrings / constants
+        self.generic_visit(node)
 
 
-def load_and_parse_json(json_path: Path):
-    config = json.loads(json_path.read_text())
-    functions = list(config["counts"].keys())
-    repos = config["repos"]
-    folder = config.get("folder", "")
-    return config, functions, repos, folder
+def count_functions_in_file(file_path: Path, target_funcs: List[str]) -> Dict[str, int]:
+    try:
+        tree = ast.parse(file_path.read_text())
+    except Exception as e:
+        console.print(f"[red]❌ Failed parsing {file_path}[/red]: {e}")
+        return {func: 0 for func in target_funcs}
 
-
-def count_function_usage_in_repo(repo_path: Path, functions: list[str], folder: str):
-    counts = {fn: 0 for fn in functions}
-    function_patterns = [re.compile(rf'\b{re.escape(fn)}\b') for fn in functions]
-
-    for path in repo_path.rglob("*.py"):
-        if folder and folder not in str(path):
-            continue
-
-        with open(path, "r", encoding="utf-8") as f:
-            try:
-                tokens = list(tokenize.generate_tokens(f.readline))
-            except tokenize.TokenError:
-                continue
-
-        current_line = ""
-        line_no = -1
-        for token_type, token_string, (start_row, _), (_, _), _ in tokens:
-            if start_row != line_no:
-                if current_line:
-                    for fn, pattern in zip(functions, function_patterns):
-                        if pattern.search(current_line) and not is_in_comment_or_logger(current_line):
-                            counts[fn] += 1
-                current_line = token_string
-                line_no = start_row
-            else:
-                current_line += token_string
-
-        if current_line:
-            for fn, pattern in zip(functions, function_patterns):
-                if pattern.search(current_line) and not is_in_comment_or_logger(current_line):
-                    counts[fn] += 1
-
-    return counts
+    counter = FunctionUsageCounter(target_funcs)
+    counter.visit(tree)
+    return counter.counts
 
 
 @app.command()
 def count_usage_from_file(
-    json_path: Path = typer.Argument(..., help="Path to the input JSON file"),
-    token: Optional[str] = typer.Option(None, envvar="GITHUB_TOKEN")
+    config_path: Path = typer.Argument(..., help="Path to input JSON file with repos, folder, and function list")
 ):
-    """
-    Count how many times functions appear in specified folders of GitHub repos,
-    excluding lines that are comments or loggers. Uses a JSON file to drive config and saves counts back.
-    """
-    if not json_path.exists():
-        console.print(f"[red]❌ File not found:[/red] {json_path}")
+    """Counts function usage in specified repos and folder, updates counts in the same JSON file."""
+    data = json.loads(config_path.read_text())
+    target_funcs = list(data.get("counts", {}).keys())
+    repos = data.get("repos", [])
+    folder = data.get("folder", "")
+
+    if not target_funcs or not repos or not folder:
+        console.print("[red]❌ Invalid JSON input. Ensure it has 'repos', 'folder', and 'counts'.[/red]")
         raise typer.Exit(1)
 
-    config, functions, repos, folder = load_and_parse_json(json_path)
-    g = Github(token)
-    temp_root = Path(".gh-temp")
+    total_counts = {func: 0 for func in target_funcs}
 
-    for repo_full in repos:
-        console.print(f"[yellow]🔍 Cloning:[/yellow] {repo_full}")
-        repo_name = repo_full.split("/")[-1]
-        local_path = temp_root / repo_name
-        if not local_path.exists():
-            Repo.clone_from(f"https://github.com/{repo_full}.git", local_path)
-        else:
-            repo = Repo(local_path)
-            repo.git.pull()
+    for repo_name in repos:
+        console.print(f"[blue]🔍 Scanning:[/blue] {repo_name}/{folder}")
+        repo_path = Path("repos") / repo_name.replace("/", "_")
+        target_dir = repo_path / folder
 
-        result = count_function_usage_in_repo(local_path, functions, folder)
-        for fn in functions:
-            config["counts"][fn] += result[fn]
+        if not target_dir.exists():
+            console.print(f"[red]❌ Folder not found:[/red] {target_dir}")
+            continue
 
-    json_path.write_text(json.dumps(config, indent=2))
-    console.print(f"[green]✅ Updated counts saved to:[/green] {json_path}")
+        for file in target_dir.rglob("*.py"):
+            file_counts = count_functions_in_file(file, target_funcs)
+            for func in target_funcs:
+                total_counts[func] += file_counts[func]
+
+    data["counts"] = total_counts
+    config_path.write_text(json.dumps(data, indent=2))
+    console.print("[green]✅ Updated counts saved in:[/green]", config_path)
 
 
-"""
-Example usage:
-
-1. Create input.json:
-{
-  "repos": ["org/repo1", "user/repo2"],
-  "folder": "src/",
-  "counts": {
-    "get_d": 0,
-    "set_d": 0
-  }
-}
-
-2. Run:
-$ python app.py count-usage-from-file input.json
-
-This will:
-- Clone/pull each repo.
-- Search in the "src/" folder of each repo.
-- Count usage of each function (from "counts" keys).
-- Skip commented/logged lines.
-- Write updated counts back to the same JSON file.
-"""
+if __name__ == "__main__":
+    app()
