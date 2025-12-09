@@ -1,0 +1,99 @@
+import os
+import ast
+import json
+from pathlib import Path
+from typing import Dict, Set
+from git import Repo
+import typer
+
+app = typer.Typer(help="Counts real function usage in GitHub repos")
+
+LOGGER_NAMES = {"logger", "log", "logging", "Logger"}
+
+def is_logger_call(node: ast.Call) -> bool:
+    if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
+        return node.func.value.id in LOGGER_NAMES
+    return False
+
+def extract_names(node: ast.AST) -> Set[str]:
+    names = set()
+    if isinstance(node, ast.Attribute):
+        names |= extract_names(node.value)
+        names.add(node.attr)
+    elif isinstance(node, ast.Call):
+        names |= extract_names(node.func)
+    elif isinstance(node, ast.Name):
+        names.add(node.id)
+    return names
+
+def count_function_usage(file_path: Path, targets: Set[str]) -> Dict[str, int]:
+    with open(file_path, "r", encoding="utf-8") as f:
+        source = f.read()
+
+    try:
+        tree = ast.parse(source, filename=str(file_path))
+    except SyntaxError:
+        return {key: 0 for key in targets}
+
+    counts = {key: 0 for key in targets}
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            if is_logger_call(node):
+                continue
+            found = extract_names(node)
+            for key in targets:
+                if key in found:
+                    counts[key] += 1
+
+        elif isinstance(node, ast.Attribute):
+            found = extract_names(node)
+            for key in targets:
+                if key in found:
+                    counts[key] += 1
+
+    return counts
+
+def clone_repo(github_repo: str) -> Path:
+    name = github_repo.split("/")[-1]
+    local_path = Path("_repos") / name
+    if local_path.exists():
+        return local_path
+
+    print(f"Cloning {github_repo}...")
+
+    token = os.environ.get("GITHUB_TOKEN", "")
+    if not token:
+        raise EnvironmentError("GITHUB_TOKEN environment variable not set")
+
+    url = f"https://{token}@github.com/{github_repo}.git"
+
+    Repo.clone_from(url, local_path)
+    return local_path
+
+def update_counts_from_file(config_path: Path):
+    data = json.loads(config_path.read_text())
+    repos = data["repos"]
+    folder = data["folder"]
+    targets = set(data["counts"].keys())
+    total_counts = {k: 0 for k in targets}
+
+    for repo in repos:
+        repo_path = clone_repo(repo)
+        scan_path = repo_path / folder
+        for py_file in scan_path.rglob("*.py"):
+            file_counts = count_function_usage(py_file, targets)
+            for key in targets:
+                total_counts[key] += file_counts[key]
+
+    data["counts"] = total_counts
+    config_path.write_text(json.dumps(data, indent=2))
+    print("Updated:", config_path)
+
+@app.command()
+def count(input: Path):
+    """Count function usage and update the input JSON"""
+    update_counts_from_file(input)
+
+if __name__ == "__main__":
+    app()
