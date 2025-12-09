@@ -1,0 +1,91 @@
+import re
+import json
+import tempfile
+from pathlib import Path
+from typing import Optional
+import typer
+from git import Repo
+from rich.console import Console
+
+app = typer.Typer()
+console = Console()
+
+EXCLUDE_PATTERNS = [
+    re.compile(r"^\s*#"),                          # Comments
+    re.compile(r"logger\.[a-zA-Z_]+\("),          # logger.debug(), logger.info(), etc.
+    re.compile(r"print\("),                        # print statements
+]
+
+def is_excluded(line: str) -> bool:
+    """Check if a line should be excluded from counting."""
+    stripped = line.strip()
+    if any(p.search(stripped) for p in EXCLUDE_PATTERNS):
+        return True
+    return False
+
+def count_function_usage_in_file(file_path: Path, functions: list[str]) -> dict[str, int]:
+    counts = {f: 0 for f in functions}
+    if not file_path.suffix == ".py":
+        return counts
+
+    try:
+        with file_path.open("r", encoding="utf-8") as f:
+            content = f.read()
+
+        for fn in functions:
+            # Match obj.fn, obj.\nfn, obj.fn().something, etc.
+            pattern = re.compile(rf"(?<!['\"])(?:\w+\s*\.\s*)*{fn}\b", re.MULTILINE)
+            matches = [m.group() for m in pattern.finditer(content)]
+
+            # Filter out excluded lines
+            for match in matches:
+                start_idx = content.rfind("\n", 0, content.find(match)) + 1
+                end_idx = content.find("\n", content.find(match))
+                line = content[start_idx:end_idx]
+                if not is_excluded(line):
+                    counts[fn] += 1
+    except Exception as e:
+        console.print(f"[red]Failed to read {file_path}: {e}[/red]")
+
+    return counts
+
+def update_counts_from_repo(repo_url: str, folder: str, functions: list[str]) -> dict[str, int]:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        try:
+            repo = Repo.clone_from(f"https://github.com/{repo_url}.git", tmpdir, depth=1)
+            base_path = Path(tmpdir) / folder
+            if not base_path.exists():
+                console.print(f"[yellow]⚠️ Folder not found:[/yellow] {base_path}")
+                return {f: 0 for f in functions}
+
+            combined_counts = {f: 0 for f in functions}
+            for py_file in base_path.rglob("*.py"):
+                file_counts = count_function_usage_in_file(py_file, functions)
+                for fn in functions:
+                    combined_counts[fn] += file_counts[fn]
+
+            return combined_counts
+
+        except Exception as e:
+            console.print(f"[red]❌ Failed processing {repo_url}:[/red] {e}")
+            return {f: 0 for f in functions}
+
+@app.command("count-usage-from-file")
+def count_usage_from_file(
+    input: Path = typer.Option(..., help="Path to JSON file with 'repos', 'folder', and 'counts'"),
+    token: Optional[str] = typer.Option(None, envvar="GITHUB_TOKEN", help="GitHub token")
+):
+    """Count function usage across GitHub repos and update JSON."""
+    data = json.loads(input.read_text())
+    functions = list(data.get("counts", {}).keys())
+    updated_counts = {f: 0 for f in functions}
+
+    for repo in data.get("repos", []):
+        console.print(f"\n[cyan]🔍 Checking:[/cyan] {repo}")
+        repo_counts = update_counts_from_repo(repo, data["folder"], functions)
+        for fn in functions:
+            updated_counts[fn] += repo_counts[fn]
+
+    data["counts"] = updated_counts
+    input.write_text(json.dumps(data, indent=2))
+    console.print(f"\n[green]✅ Updated counts written to:[/green] {input}\n")
