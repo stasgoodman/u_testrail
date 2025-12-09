@@ -1,0 +1,84 @@
+@app.command()
+def edit_file(
+    repos: List[str] = typer.Argument(..., help="GitHub repositories to edit"),
+    file_path: str = typer.Option(..., help="Path to the file in the repo to edit"),
+    insert_line: Optional[int] = typer.Option(None, help="Insert text at this line (1-based index)"),
+    edit_line: Optional[int] = typer.Option(None, help="Replace text at this line (1-based index)"),
+    text: Optional[str] = typer.Option(None, help="Text to insert or replace"),
+    reference_path: Optional[str] = typer.Option(None, help="Path to a file with replacement content"),
+    branch: str = "auto-edit",
+    commit_msg: str = "chore: automated file update",
+    pr_title: str = "Automated file update",
+    pr_body: str = "This PR updates the target file as requested.",
+    token: Optional[str] = typer.Option(None, envvar="GITHUB_TOKEN")
+):
+    """
+    Edit or replace a file in multiple GitHub repos.
+
+    Usage:
+    --------
+    1. Replace entire file:
+       edit-file repo1 repo2 --file-path some.py --reference-path new.py
+
+    2. Insert or edit a line:
+       edit-file repo1 --file-path some.py --insert-line 4 --text "print('hello')"
+    """
+    if not token:
+        raise typer.BadParameter("GitHub token required via --token or env GITHUB_TOKEN")
+
+    for repo in get_github_repos(token, repos):
+        console.print(f"\n[yellow]✏️ Editing:[/yellow] {repo.full_name}")
+        try:
+            path = clone_repo(repo, token)
+            git = Repo(path)
+            git.git.checkout("-b", branch)
+
+            target_file = path / file_path
+            if not target_file.exists():
+                console.print(f"[red]❌ File not found:[/red] {file_path}")
+                continue
+
+            if reference_path:
+                reference_text = Path(reference_path).read_text()
+                target_file.write_text(reference_text)
+            else:
+                if not text:
+                    console.print("[red]❌ You must provide --text or --reference-path[/red]")
+                    continue
+                lines = target_file.read_text().splitlines()
+                if insert_line is not None:
+                    idx = insert_line - 1
+                    while len(lines) < idx:
+                        lines.append("")
+                    insert_lines = text.splitlines()
+                    lines[idx:idx] = insert_lines
+                elif edit_line is not None:
+                    idx = edit_line - 1
+                    while len(lines) <= idx:
+                        lines.append("")
+                    lines[idx] = text
+                else:
+                    console.print("[red]❌ Must use --insert-line or --edit-line if not replacing full file[/red]")
+                    continue
+                target_file.write_text("\n".join(lines) + "\n")
+
+            git.git.add(all=True)
+            git.index.commit(commit_msg)
+
+            try:
+                git.git.push("--set-upstream", "origin", branch)
+            except GitCommandError as e:
+                if "non-fast-forward" in str(e):
+                    console.print(f"[yellow]⚠️ Branch behind remote, pulling and retrying:[/yellow] {branch}")
+                    git.git.pull("origin", branch, "--rebase")
+                    git.git.push("--set-upstream", "origin", branch)
+                else:
+                    raise e
+
+            pr = find_or_create_pr(repo, branch, pr_title, pr_body)
+            if pr:
+                console.print(f"[green]✅ PR ready:[/green] {pr.html_url}")
+            else:
+                console.print(f"[yellow]⚠️ No PR created for {repo.full_name}[/yellow]")
+        except Exception as e:
+            console.print(f"[red]❌ Failed editing {repo.full_name}:[/red] {e}")
