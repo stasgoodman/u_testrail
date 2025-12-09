@@ -1,0 +1,144 @@
+import typer
+from typing import List, Optional
+from pathlib import Path
+import difflib
+import json
+import os
+import ast
+from github import Github
+from git import Repo
+from rich.console import Console
+
+app = typer.Typer()
+console = Console()
+
+def get_github_repos(token: str, repo_names: List[str]):
+    g = Github(token)
+    repos = []
+    for name in repo_names:
+        try:
+            repos.append(g.get_repo(name))
+        except Exception as e:
+            console.print(f"[red]❌ Cannot find repo:[/red] {name} - {e}")
+    return repos
+
+def clone_repo(repo, token: str):
+    url = repo.clone_url.replace("https://", f"https://{token}@")
+    path = Path(".cache") / repo.full_name.replace("/", "__")
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        Repo.clone_from(url, path)
+    return path
+
+@app.command()
+def apply_changes_from_json(json_path: Path, token: Optional[str] = typer.Option(None, envvar="GITHUB_TOKEN")):
+    """Apply multiple file edits from JSON file"""
+    if not token:
+        raise typer.BadParameter("GitHub token required via --token or env GITHUB_TOKEN")
+
+    changes = json.loads(json_path.read_text())
+
+    for item in changes:
+        repo_name = item["repo"]
+        branch = item.get("branch", "auto-edit")
+        pr_title = item.get("title", "Automated Update")
+        pr_body = item.get("body", "Auto changes from JSON")
+
+        repo = get_github_repos(token, [repo_name])[0]
+        console.print(f"\n[yellow]🛠 Editing:[/yellow] {repo.full_name}")
+        try:
+            path = clone_repo(repo, token)
+            git = Repo(path)
+            git.git.checkout("-B", branch)
+
+            for edit in item["edits"]:
+                file_target = path / edit["file_path"]
+                if not file_target.exists():
+                    console.print(f"[red]❌ File not found:[/red] {file_target}")
+                    continue
+
+                if "reference_path" in edit:
+                    content = Path(edit["reference_path"]).read_text()
+                    file_target.write_text(content)
+                    console.print(f"[green]✔ Replaced entire file:[/green] {edit['file_path']}")
+                else:
+                    lines = file_target.read_text().splitlines()
+                    line_number = edit.get("line_number")
+                    code_block = edit.get("code_block")
+                    if line_number is None or code_block is None:
+                        console.print("[red]❌ Missing line_number or code_block[/red]")
+                        continue
+                    idx = max(0, line_number - 1)
+                    insert_lines = code_block.splitlines()
+                    while len(lines) < idx:
+                        lines.append("")
+                    lines[idx:idx] = insert_lines
+                    file_target.write_text("\n".join(lines) + "\n")
+                    console.print(f"[green]✔ Inserted code at line {line_number} in {edit['file_path']}[/green]")
+
+            git.git.add(all=True)
+            git.index.commit(pr_title)
+            git.git.pull("origin", repo.default_branch, rebase=True)
+            git.git.push("--set-upstream", "origin", branch)
+
+            # check for existing PR
+            existing = [pr for pr in repo.get_pulls(state="open", head=f"{repo.owner.login}:{branch}")]
+            if existing:
+                pr = existing[0]
+                pr.edit(title=pr_title, body=pr_body)
+                console.print(f"[blue]ℹ Updated existing PR:[/blue] {pr.html_url}")
+            else:
+                pr = repo.create_pull(title=pr_title, body=pr_body, head=branch, base=repo.default_branch)
+                console.print(f"[green]✅ Created new PR:[/green] {pr.html_url}")
+
+        except Exception as e:
+            console.print(f"[red]❌ Failed editing {repo_name}:[/red] {e}")
+
+@app.command()
+def diff_file(
+    repo: str = typer.Argument(...),
+    file_path: str = typer.Option(...),
+    local_file: Path = typer.Option(...),
+    token: Optional[str] = typer.Option(None, envvar="GITHUB_TOKEN")
+):
+    """Compare GitHub file with local file"""
+    if not token:
+        raise typer.BadParameter("GitHub token required")
+    r = get_github_repos(token, [repo])[0]
+    path = clone_repo(r, token)
+    target = path / file_path
+    if not target.exists():
+        console.print(f"[red]❌ File not found in repo:[/red] {file_path}")
+        raise typer.Exit()
+    repo_lines = target.read_text().splitlines()
+    local_lines = local_file.read_text().splitlines()
+    diff = difflib.unified_diff(repo_lines, local_lines, fromfile="repo", tofile="local", lineterm="")
+    for line in diff:
+        print(line)
+
+@app.command()
+def count_usage(
+    repo: str = typer.Argument(...),
+    functions: List[str] = typer.Argument(...),
+    token: Optional[str] = typer.Option(None, envvar="GITHUB_TOKEN")
+):
+    """Count usage of specific functions in a repo"""
+    if not token:
+        raise typer.BadParameter("GitHub token required")
+    r = get_github_repos(token, [repo])[0]
+    path = clone_repo(r, token)
+    counts = {fn: 0 for fn in functions}
+    for py_file in path.rglob("*.py"):
+        try:
+            tree = ast.parse(py_file.read_text())
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                    if node.func.id in counts:
+                        counts[node.func.id] += 1
+        except Exception:
+            continue
+    for fn, count in counts.items():
+        console.print(f"[cyan]{fn}[/cyan]: {count} calls")
+
+if __name__ == "__main__":
+    app()
