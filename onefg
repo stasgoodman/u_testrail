@@ -1,0 +1,121 @@
+import json
+import re
+import tokenize
+from pathlib import Path
+from typing import Optional
+import typer
+from git import Repo
+from github import Github
+from rich.console import Console
+
+app = typer.Typer()
+console = Console()
+
+
+def is_in_comment_or_logger(line: str) -> bool:
+    # Check if the line is a comment or logger usage
+    stripped = line.strip()
+    return stripped.startswith("#") or "logger." in stripped or "log." in stripped
+
+
+def load_and_parse_json(json_path: Path):
+    config = json.loads(json_path.read_text())
+    functions = list(config["counts"].keys())
+    repos = config["repos"]
+    folder = config.get("folder", "")
+    return config, functions, repos, folder
+
+
+def count_function_usage_in_repo(repo_path: Path, functions: list[str], folder: str):
+    counts = {fn: 0 for fn in functions}
+    function_patterns = [re.compile(rf'\b{re.escape(fn)}\b') for fn in functions]
+
+    for path in repo_path.rglob("*.py"):
+        if folder and folder not in str(path):
+            continue
+
+        with open(path, "r", encoding="utf-8") as f:
+            try:
+                tokens = list(tokenize.generate_tokens(f.readline))
+            except tokenize.TokenError:
+                continue
+
+        current_line = ""
+        line_no = -1
+        for token_type, token_string, (start_row, _), (_, _), _ in tokens:
+            if start_row != line_no:
+                if current_line:
+                    for fn, pattern in zip(functions, function_patterns):
+                        if pattern.search(current_line) and not is_in_comment_or_logger(current_line):
+                            counts[fn] += 1
+                current_line = token_string
+                line_no = start_row
+            else:
+                current_line += token_string
+
+        if current_line:
+            for fn, pattern in zip(functions, function_patterns):
+                if pattern.search(current_line) and not is_in_comment_or_logger(current_line):
+                    counts[fn] += 1
+
+    return counts
+
+
+@app.command()
+def count_usage_from_file(
+    json_path: Path = typer.Argument(..., help="Path to the input JSON file"),
+    token: Optional[str] = typer.Option(None, envvar="GITHUB_TOKEN")
+):
+    """
+    Count how many times functions appear in specified folders of GitHub repos,
+    excluding lines that are comments or loggers. Uses a JSON file to drive config and saves counts back.
+    """
+    if not json_path.exists():
+        console.print(f"[red]❌ File not found:[/red] {json_path}")
+        raise typer.Exit(1)
+
+    config, functions, repos, folder = load_and_parse_json(json_path)
+    g = Github(token)
+    temp_root = Path(".gh-temp")
+
+    for repo_full in repos:
+        console.print(f"[yellow]🔍 Cloning:[/yellow] {repo_full}")
+        repo_name = repo_full.split("/")[-1]
+        local_path = temp_root / repo_name
+        if not local_path.exists():
+            Repo.clone_from(f"https://github.com/{repo_full}.git", local_path)
+        else:
+            repo = Repo(local_path)
+            repo.git.pull()
+
+        result = count_function_usage_in_repo(local_path, functions, folder)
+        for fn in functions:
+            config["counts"][fn] += result[fn]
+
+    json_path.write_text(json.dumps(config, indent=2))
+    console.print(f"[green]✅ Updated counts saved to:[/green] {json_path}")
+
+
+"""
+Example usage:
+
+1. Create input.json:
+{
+  "repos": ["org/repo1", "user/repo2"],
+  "folder": "src/",
+  "counts": {
+    "get_d": 0,
+    "set_d": 0
+  }
+}
+
+2. Run:
+$ python app.py count-usage-from-file input.json
+
+This will:
+- Clone/pull each repo.
+- Search in the "src/" folder of each repo.
+- Count usage of each function (from "counts" keys).
+- Skip commented/logged lines.
+- Write updated counts back to the same JSON file.
+"""
