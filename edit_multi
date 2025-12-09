@@ -1,0 +1,73 @@
+@app.command()
+def edit_files(
+    repos: List[str] = typer.Argument(..., help="GitHub repositories to edit"),
+    changes_path: Path = typer.Option(..., help="Path to JSON file defining file edits"),
+    branch: str = "multi-edit",
+    commit_msg: str = "chore: apply multiple edits",
+    pr_title: str = "Automated multi-file edit",
+    pr_body: str = "This PR applies several requested file changes.",
+    token: Optional[str] = typer.Option(None, envvar="GITHUB_TOKEN")
+):
+    """
+    Apply multiple file edits (insert or replace) per repo in one PR.
+    JSON format:
+    [
+      {"file_path": "src/file.py", "insert_line": 10, "text": "code"},
+      {"file_path": "src/utils.py", "edit_line": 7, "text": "replacement"}
+    ]
+    """
+    if not token:
+        raise typer.BadParameter("GitHub token required via --token or env GITHUB_TOKEN")
+
+    changes = json.loads(changes_path.read_text())
+
+    for repo in get_github_repos(token, repos):
+        try:
+            console.print(f"\n[cyan]🔧 Processing repo:[/cyan] {repo.full_name}")
+            path = clone_repo(repo, token)
+            git = Repo(path)
+            git.git.checkout("-B", branch)
+
+            for change in changes:
+                file_path = path / change["file_path"]
+                if not file_path.exists():
+                    console.print(f"[red]❌ File not found:[/red] {change['file_path']}")
+                    continue
+
+                lines = file_path.read_text().splitlines()
+                text_lines = change["text"].splitlines()
+
+                if "insert_line" in change:
+                    idx = change["insert_line"] - 1
+                    lines[idx:idx] = text_lines
+                elif "edit_line" in change:
+                    idx = change["edit_line"] - 1
+                    while len(lines) <= idx:
+                        lines.append("")
+                    lines[idx] = change["text"]
+
+                file_path.write_text("\n".join(lines) + "\n")
+
+            git.git.add(all=True)
+            git.index.commit(commit_msg)
+            git.git.push("--set-upstream", "origin", branch)
+
+            prs = list(repo.get_pulls(state="open", head=f"{repo.owner.login}:{branch}"))
+            if prs:
+                prs[0].edit(title=pr_title, body=pr_body)
+                console.print(f"[blue]🔄 Updated PR:[/blue] {prs[0].html_url}")
+            else:
+                pr = repo.create_pull(title=pr_title, body=pr_body, head=branch, base=repo.default_branch)
+                console.print(f"[green]✅ PR created:[/green] {pr.html_url}")
+
+        except Exception as e:
+            console.print(f"[red]❌ Error editing {repo.full_name}:[/red] {e}")
+
+python app.py edit-files \
+  stasgoodman/u_testrail \
+  --changes-path changes.json \
+  --branch fix-batch-edits \
+  --commit-msg "chore: batch edits across multiple files" \
+  --pr-title "Batch code improvements" \
+  --pr-body "This PR includes multiple file updates applied via automation." \
+  --token ghp_xxx1234567890abcdef
