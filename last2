@@ -1,0 +1,219 @@
+import ast
+import json
+import logging
+import re
+import tempfile
+from pathlib import Path
+from typing import List, Optional, Tuple, Dict
+
+import git
+import pandas as pd
+import typer
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+
+app = typer.Typer(help="Function usage counter CLI")
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+log = logging.getLogger(__name__)
+
+
+def clone_repo(repo_full_name: str, token: Optional[str] = None) -> Path:
+    """
+    Clone a GitHub repo using HTTPS. Supports optional GitHub token.
+    """
+    org, name = repo_full_name.strip().split("/")
+    repo_url = f"https://github.com/{org}/{name}.git"
+    temp_dir = Path(tempfile.gettempdir()) / f"{org}__{name}"
+    if temp_dir.exists():
+        log.info(f"✔ Repo already cloned: {repo_full_name}")
+        return temp_dir
+    log.info(f"⏳ Cloning {repo_full_name} ...")
+    if token:
+        repo_url = f"https://{token}:x-oauth-basic@github.com/{org}/{name}.git"
+    git.Repo.clone_from(repo_url, temp_dir)
+    log.info(f"✅ Cloned to: {temp_dir}")
+    return temp_dir
+
+
+def is_logger_call(node: ast.Call) -> bool:
+    """
+    Returns True if the function call is within a logger.* statement.
+    """
+    return (
+        isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "logger"
+    )
+
+
+def get_chained_attrs(node: ast.AST) -> List[str]:
+    """
+    Extract a chain of attributes from a node like `a.b.c()` → ['a', 'b', 'c']
+    """
+    parts = []
+
+    while isinstance(node, ast.Attribute):
+        parts.insert(0, node.attr)
+        node = node.value
+
+    if isinstance(node, ast.Name):
+        parts.insert(0, node.id)
+
+    return parts
+
+
+def extract_matches_from_file(file_path: Path, targets: Tuple[str], debug: bool = False) -> List[Dict]:
+    """
+    Extracts target function usages from one Python file using AST.
+    Skips commented lines and logger calls.
+    Returns a list of dicts with target, line_info, and chain.
+    """
+    results = []
+
+    try:
+        content = file_path.read_text()
+    except Exception:
+        return results
+
+    try:
+        root = ast.parse(content)
+    except SyntaxError:
+        return results
+
+    lines = content.splitlines()
+
+    for node in ast.walk(root):
+        if isinstance(node, ast.Call):
+            if is_logger_call(node):
+                if debug:
+                    log.debug(f"🟡 Skipped logger call at {file_path}:{node.lineno}")
+                continue
+
+            chain = get_chained_attrs(node.func)
+            if not chain:
+                continue
+
+            for target in targets:
+                if any(part.startswith(target) for part in chain):
+                    src_line = lines[node.lineno - 1].strip()
+                    if src_line.startswith("#"):
+                        if debug:
+                            log.debug(f"🟡 Skipped comment line at {file_path}:{node.lineno}")
+                        continue
+
+                    results.append({
+                        "target": target,
+                        "line_info": f"{file_path}:{node.lineno}",
+                        "chain": chain
+                    })
+
+    return results
+
+
+def analyze_repo(path: Path, targets: Tuple[str], debug: bool = False) -> pd.DataFrame:
+    """
+    Analyze all `.py` files in the path recursively.
+    Returns a dataframe with target, line_info, and chain.
+    """
+    matches = []
+
+    for file_path in path.rglob("*.py"):
+        matches.extend(extract_matches_from_file(file_path, targets, debug))
+
+    return pd.DataFrame(matches)
+
+
+def save_repo_dataframes_to_excel(
+    repo_dfs: Dict[str, pd.DataFrame], summary_df: pd.DataFrame, output_file: Path
+):
+    """
+    Save repo-specific match data and summary into Excel with formatting.
+    """
+    with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
+        for repo, df in repo_dfs.items():
+            sheet_name = repo.replace("/", "_") + "_matches"
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+        summary_df.to_excel(writer, sheet_name="summary", index=False)
+
+    # Auto-adjust column widths
+    wb = load_workbook(output_file)
+    for sheet in wb.worksheets:
+        for col in sheet.columns:
+            max_len = 0
+            col_letter = get_column_letter(col[0].column)
+            for cell in col:
+                try:
+                    val = str(cell.value)
+                    if len(val) > max_len:
+                        max_len = len(val)
+                except:
+                    pass
+            sheet.column_dimensions[col_letter].width = max_len + 2
+    wb.save(output_file)
+
+
+@app.command()
+def count_usage(
+    config_path: Optional[Path] = typer.Option(None, help="JSON config file with all options"),
+    repos: Optional[List[str]] = typer.Option(None, help="Repos list (e.g. org/repo)"),
+    folder: Optional[str] = typer.Option(None, help="Subfolder to scan (default: src/)"),
+    counts: Optional[List[str]] = typer.Option(None, help="Function prefixes to count"),
+    output: Optional[Path] = typer.Option(None, help="Output Excel path (default: usage.xlsx)"),
+    debug: Optional[bool] = typer.Option(False, help="Enable debug logging")
+):
+    """
+    Count function usages across GitHub repos. Supports JSON config.
+    Generates Excel with per-repo and summary sheets.
+    """
+
+    # ─── Load JSON Config ───────────────────────
+    config = {}
+    if config_path and config_path.exists():
+        config = json.loads(config_path.read_text())
+
+    repos = repos or config.get("repos")
+    folder = folder or config.get("folder", "src/")
+    counts = counts or config.get("counts", [])
+    output = output or Path(config.get("output", "function_usage.xlsx"))
+    debug = debug or config.get("debug", False)
+
+    if not repos or not counts:
+        typer.secho("❌ repos and counts are required.", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+    targets = tuple(counts)
+    all_matches = []
+    repo_dfs = {}
+
+    # ─── Main Logic ─────────────────────────────
+    for repo in repos:
+        local_repo = clone_repo(repo)
+        full_path = local_repo / folder
+        df = analyze_repo(full_path, targets, debug)
+        if not df.empty:
+            repo_dfs[repo] = df
+            all_matches.extend(df.to_dict("records"))
+        else:
+            log.warning(f"⚠️ No matches in {repo}")
+
+    if not all_matches:
+        typer.secho("⚠️ No matches found across all repos.", fg=typer.colors.YELLOW)
+        return
+
+    df_all = pd.DataFrame(all_matches)
+    df_all["folder"] = df_all["line_info"].apply(lambda x: "/".join(Path(x).parts[1:-1]))
+
+    summary_df = (
+        df_all.groupby(["target", "folder"])
+        .agg(
+            call_count=("line_info", "count"),
+            chains=("chain", lambda x: list({tuple(c) for c in x}))
+        )
+        .reset_index()
+    )
+
+    save_repo_dataframes_to_excel(repo_dfs, summary_df, output)
+
+    typer.secho(f"✅ Analysis complete. Excel saved to {output}", fg=typer.colors.GREEN)
