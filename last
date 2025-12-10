@@ -1,0 +1,317 @@
+"""
+Function Usage Analyzer
+=======================
+
+A reusable, modular, and GitHub‑aware static analysis tool that scans Python
+files across multiple GitHub repositories and counts function usages based on
+prefix matching (e.g. "get_d_" matches "get_d_config", "get_d_value", etc.).
+
+It detects:
+    • direct usages:     get_d_x()
+    • attribute usages:  obj.get_d_x()
+    • chained calls:     obj.get_d_x().foo()
+    • multiline chains:  obj.\
+                             get_d_x()
+
+It excludes:
+    • logger calls (e.g. logger.get_d_x, self.logger.get_d_x)
+    • comments
+    • strings / docstrings
+    • repeated counts on the same line (deduplicated)
+
+The module exposes:
+    - clone_repo(): clone GitHub repos using GITHUB_TOKEN
+    - analyze_python_file(): AST analysis of one file
+    - run_usage_analysis(): analyze full repo set → DataFrames
+
+This module is designed for future reuse:
+    - extend prefix matching to suffix/regex
+    - integrate decorator/function definition detection
+    - reuse clone_repo() for other tools
+
+Author: ChatGPT (architected for Goodman)
+"""
+
+import os
+import ast
+from pathlib import Path
+from typing import List, Dict, Set, Any, Tuple
+import pandas as pd
+from git import Repo
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Repo Handling
+# ──────────────────────────────────────────────────────────────────────────────
+
+def clone_repo(github_repo: str, base_dir: Path = Path("_repos")) -> Path:
+    """
+    Clone a GitHub repository using a personal access token.
+
+    The GITHUB_TOKEN environment variable must be set. If the repository
+    has already been cloned earlier, it is reused without performing
+    another clone.
+
+    Args:
+        github_repo:
+            A GitHub repository string in "owner/name" format.
+        base_dir:
+            Directory where repositories are stored locally.
+
+    Returns:
+        Path object representing the local clone of the repository.
+
+    Raises:
+        EnvironmentError: If GITHUB_TOKEN is not defined.
+    """
+    repo_name = github_repo.split("/")[-1]
+    local_path = base_dir / repo_name
+
+    if local_path.exists():
+        return local_path
+
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        raise EnvironmentError("GITHUB_TOKEN environment variable is not set.")
+
+    url = f"https://{token}@github.com/{github_repo}.git"
+    print(f"🔄 Cloning {github_repo} …")
+
+    Repo.clone_from(url, local_path)
+    return local_path
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# AST Utilities
+# ──────────────────────────────────────────────────────────────────────────────
+
+LOGGER_PATTERNS = ["logger", "log", "logging"]
+
+
+def get_attr_chain(node: ast.AST) -> List[str]:
+    """
+    Extract a full call/attribute chain from a Python AST node.
+
+    Example:
+        obj.get_d_x().foo → ['obj', 'get_d_x', 'foo']
+
+    This is the foundation for analyzing chained function calls.
+
+    Args:
+        node: A Python AST node.
+
+    Returns:
+        List of names that form the chain.
+    """
+    if isinstance(node, ast.Name):
+        return [node.id]
+
+    if isinstance(node, ast.Attribute):
+        return get_attr_chain(node.value) + [node.attr]
+
+    if isinstance(node, ast.Call):
+        return get_attr_chain(node.func)
+
+    return []
+
+
+def is_logger_chain(chain: List[str]) -> bool:
+    """
+    Determine whether any name in a chain belongs to a logger object.
+
+    Logger names may appear as:
+        logger, self.logger, svc_logger, app.log, logging,…
+
+    We normalize the chain and check substrings.
+
+    Args:
+        chain:
+            List of strings representing the call chain.
+
+    Returns:
+        True if chain is logger-related, otherwise False.
+    """
+    chain_lower = [c.lower() for c in chain]
+    return any(
+        any(pattern in name for pattern in LOGGER_PATTERNS)
+        for name in chain_lower
+    )
+
+
+def match_target_prefix(name: str, prefixes: Set[str]) -> str | None:
+    """
+    Match a function name against a set of prefixes.
+
+    Example:
+        "get_d_config" → matches "get_d_"
+
+    Args:
+        name:
+            Function or attribute name.
+        prefixes:
+            Set of prefixes to match against.
+
+    Returns:
+        The matched prefix, or None if no prefix matches.
+    """
+    for prefix in prefixes:
+        if name.startswith(prefix):
+            return prefix
+    return None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# File Analyzer
+# ──────────────────────────────────────────────────────────────────────────────
+
+def analyze_python_file(
+    file_path: Path,
+    target_prefixes: Set[str],
+    debug: bool = False
+) -> List[Dict[str, Any]]:
+    """
+    Analyze a Python file using AST to detect function usage by prefix.
+
+    Deduplicates multiple detections on the same line and excludes logger calls.
+
+    Args:
+        file_path:
+            Path to a .py file.
+        target_prefixes:
+            Set of allowed prefixes (e.g. {"get_d_", "get_c_"}).
+        debug:
+            If True, prints match details.
+
+    Returns:
+        A list of match dictionaries with keys:
+            "target"     — matched prefix
+            "line_info"  — "<path>:<line>"
+            "chain"      — list representing the call chain
+    """
+    try:
+        source = file_path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(file_path))
+    except (SyntaxError, UnicodeDecodeError):
+        if debug:
+            print(f"⚠️ Skipped invalid file: {file_path}")
+        return []
+
+    seen: Set[Tuple[str, int]] = set()
+    matches: List[Dict[str, Any]] = []
+
+    for node in ast.walk(tree):
+        if not hasattr(node, "lineno"):
+            continue
+
+        line_no = node.lineno
+        line_info = f"{file_path}:{line_no}"
+
+        # Attribute or call chain
+        if isinstance(node, (ast.Attribute, ast.Call)):
+            chain = get_attr_chain(node)
+
+            if is_logger_chain(chain):
+                if debug:
+                    print(f"🚫 Skip logger call: {chain} @ {line_info}")
+                continue
+
+            for name in chain:
+                matched = match_target_prefix(name, target_prefixes)
+                if matched and (matched, line_no) not in seen:
+                    seen.add((matched, line_no))
+                    matches.append({
+                        "target": matched,
+                        "line_info": line_info,
+                        "chain": chain
+                    })
+                    if debug:
+                        print(f"✔️ Match: {matched} @ {line_info} → {chain}")
+
+        # Direct name (e.g. return get_d_x)
+        elif isinstance(node, ast.Name):
+            matched = match_target_prefix(node.id, target_prefixes)
+            if matched and (matched, line_no) not in seen:
+                seen.add((matched, line_no))
+                matches.append({
+                    "target": matched,
+                    "line_info": line_info,
+                    "chain": [node.id]
+                })
+                if debug:
+                    print(f"✔️ Direct match: {matched} @ {line_info}")
+
+    return matches
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main Runner
+# ──────────────────────────────────────────────────────────────────────────────
+
+def run_usage_analysis(
+    repos: List[str],
+    folder: str,
+    counts: Tuple[str, ...],
+    debug: bool = False
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Run full function usage analysis across multiple GitHub repositories.
+
+    Args:
+        repos:
+            List of GitHub repos in "owner/name" format.
+        folder:
+            Subfolder inside each repo to scan (e.g. "src/").
+        counts:
+            Tuple of function name prefixes to count (e.g. ("get_d_", "set_d_")).
+        debug:
+            Enables verbose logging.
+
+    Returns:
+        matches_df:
+            DataFrame with columns:
+                - target
+                - line_info
+                - chain
+                - folder (parsed from path)
+
+        summary_df:
+            Grouped DataFrame:
+                - target
+                - folder
+                - call_count
+                - chains (unique list of used chains)
+    """
+    prefixes = set(counts)
+    all_matches = []
+
+    for repo in repos:
+        repo_path = clone_repo(repo)
+        scan_path = repo_path / folder
+
+        if not scan_path.exists():
+            print(f"⚠️ Missing folder in repo: {scan_path}")
+            continue
+
+        for py_file in scan_path.rglob("*.py"):
+            file_matches = analyze_python_file(py_file, prefixes, debug=debug)
+            all_matches.extend(file_matches)
+
+    matches_df = pd.DataFrame(all_matches)
+    if matches_df.empty:
+        print("⚠️ No function matches found.")
+        return matches_df, pd.DataFrame()
+
+    matches_df["folder"] = matches_df["line_info"].apply(
+        lambda x: "/".join(Path(x).parts[1:-1])
+    )
+
+    summary_df = (
+        matches_df.groupby(["target", "folder"])
+        .agg(
+            call_count=("line_info", "count"),
+            chains=("chain", lambda rows: list({tuple(c) for c in rows}))
+        )
+        .reset_index()
+    )
+
+    return matches_df, summary_df
