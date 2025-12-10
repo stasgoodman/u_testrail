@@ -1,0 +1,278 @@
+# ─────────────────────────────────────────────────────────────
+# cli.py
+# ─────────────────────────────────────────────────────────────
+"""
+CLI entry point for Function Usage Toolkit.
+
+Provides a Typer CLI interface for analyzing function usage across GitHub repositories.
+Currently supports a `count-usage` command that:
+- Clones specified repositories.
+- Parses Python files using AST.
+- Finds usage of function chains matching target prefixes.
+- Outputs Excel summaries.
+
+Designed for future extensibility with modular commands.
+"""
+import typer
+from pathlib import Path
+import json
+from typing import Optional, List
+from git import Repo
+import tempfile
+import ast
+import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+
+# Typer app setup
+app = typer.Typer(help="Function Usage Toolkit for GitHub Repos.")
+
+
+# ─────────────────────────────────────────────────────────────
+# core/repo_handler.py
+# ─────────────────────────────────────────────────────────────
+"""
+GitHub Repository Utilities.
+
+Contains logic to clone GitHub repositories into a temporary local folder.
+"""
+
+def clone_repo(repo_url: str) -> Path:
+    """
+    Clone a GitHub repository using HTTPS and return the local path.
+
+    Args:
+        repo_url (str): GitHub repo in "user/repo" format.
+
+    Returns:
+        Path: Local path to the cloned repository.
+    """
+    tmpdir = tempfile.TemporaryDirectory()
+    clone_path = Path(tmpdir.name) / repo_url.replace("/", "_")
+    Repo.clone_from(f"https://github.com/{repo_url}.git", clone_path)
+    return clone_path
+
+
+# ─────────────────────────────────────────────────────────────
+# core/ast_utils.py
+# ─────────────────────────────────────────────────────────────
+"""
+AST Utilities.
+
+Provides logic to extract attribute/function call chains from parsed Python code.
+Used to detect chained calls like some.get_d().x or obj.set_d().call().
+"""
+
+def extract_function_chains(node: ast.AST):
+    """
+    Recursively extract attribute/function chains from an AST node.
+    e.g. some.get_d().x becomes ['some', 'get_d', 'x']
+
+    Args:
+        node (ast.AST): AST node
+
+    Yields:
+        List[str]: List of attribute/function parts
+    """
+    if isinstance(node, ast.Attribute):
+        chain = []
+        while isinstance(node, ast.Attribute):
+            chain.append(node.attr)
+            node = node.value
+        if isinstance(node, ast.Name):
+            chain.append(node.id)
+            yield list(reversed(chain))
+    for child in ast.iter_child_nodes(node):
+        yield from extract_function_chains(child)
+
+
+# ─────────────────────────────────────────────────────────────
+# core/usage_analyzer.py
+# ─────────────────────────────────────────────────────────────
+"""
+Function Usage Analyzer.
+
+Uses AST to walk Python files and count chained function calls,
+while excluding matches found in loggers or comments.
+Returns a DataFrame of all valid matches.
+"""
+
+LOGGER_SKIP_KEYWORDS = ("logger.", ".logger", "logging.")
+
+def is_skippable(line: str) -> bool:
+    """
+    Check if a line should be skipped (comment or logger).
+
+    Args:
+        line (str): Source code line
+
+    Returns:
+        bool: True if line should be skipped
+    """
+    return any(kw in line for kw in LOGGER_SKIP_KEYWORDS) or line.strip().startswith("#")
+
+
+def analyze_repo(folder: Path, targets: tuple, debug: bool = False) -> pd.DataFrame:
+    """
+    Analyze Python files under the folder for usage of specific function prefixes.
+
+    Args:
+        folder (Path): Folder path
+        targets (tuple): Function prefixes (e.g., 'get_d', 'set_d')
+        debug (bool): Print debug info if True
+
+    Returns:
+        pd.DataFrame: Raw matches with target, line_info, match chain
+    """
+    results = []
+    seen = set()
+
+    for py_file in folder.rglob("*.py"):
+        try:
+            lines = py_file.read_text(encoding="utf-8").splitlines()
+            for idx, line in enumerate(lines, 1):
+                if is_skippable(line):
+                    continue
+                try:
+                    node = ast.parse(line, mode="exec")
+                    for chain in extract_function_chains(node):
+                        match_str = ".".join(chain)
+                        for target in targets:
+                            if any(part.startswith(target) for part in chain):
+                                key = (py_file, idx, target, match_str)
+                                if key not in seen:
+                                    seen.add(key)
+                                    results.append({
+                                        "target": target,
+                                        "line_info": f"{py_file}:{idx}",
+                                        "chain": chain,
+                                        "match": match_str
+                                    })
+                except Exception:
+                    continue  # ignore broken one-liners
+        except Exception as e:
+            if debug:
+                print(f"⚠️ Failed to parse {py_file}: {e}")
+
+    return pd.DataFrame(results)
+
+
+# ─────────────────────────────────────────────────────────────
+# core/excel_writer.py
+# ─────────────────────────────────────────────────────────────
+"""
+Excel Output Writer.
+
+Formats and saves repo analysis results to a .xlsx file with:
+- Per-repo match tabs.
+- Global summary.
+- Auto-sized columns for readability.
+"""
+
+def autosize_columns(ws):
+    """
+    Adjust Excel column widths based on the longest cell value.
+
+    Args:
+        ws: openpyxl worksheet
+    """
+    for col in ws.columns:
+        max_length = 0
+        col_letter = get_column_letter(col[0].column)
+        for cell in col:
+            if cell.value:
+                max_length = max(max_length, len(str(cell.value)))
+        ws.column_dimensions[col_letter].width = max_length + 2
+
+
+def save_repo_dataframes_to_excel(repo_dfs: dict, output_path: Path):
+    """
+    Save per-repo results + summary to an Excel file.
+
+    Args:
+        repo_dfs (dict): Mapping of repo → pd.DataFrame
+        output_path (Path): Path to .xlsx output
+    """
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        summary_rows = []
+
+        for repo, df in repo_dfs.items():
+            name = repo.replace("/", "_")
+            df.to_excel(writer, sheet_name=f"{name}_matches", index=False)
+            summary = (
+                df.groupby(["target"])
+                .agg(call_count=("line_info", "count"), files=("line_info", "nunique"))
+                .reset_index()
+            )
+            summary["repo"] = repo
+            summary_rows.append(summary)
+
+        summary_df = pd.concat(summary_rows, ignore_index=True)
+        summary_df.to_excel(writer, sheet_name="summary", index=False)
+
+    wb = load_workbook(output_path)
+    for sheet in wb.worksheets:
+        autosize_columns(sheet)
+    wb.save(output_path)
+
+
+# ─────────────────────────────────────────────────────────────
+# commands/count_usage.py (inside app CLI)
+# ─────────────────────────────────────────────────────────────
+"""
+Implements `count-usage` Typer subcommand.
+
+- Accepts CLI or config.json.
+- Clones repos and analyzes specified folders.
+- Generates Excel report with tab for each repo.
+- Summary tab with target usage count per repo.
+"""
+
+@app.command("count-usage")
+def run(
+    config_path: Optional[Path] = typer.Option(None, help="Path to JSON config"),
+    repos: Optional[List[str]] = typer.Option(None, help="List of GitHub repos"),
+    folder: Optional[str] = typer.Option(None, help="Subfolder to analyze, e.g., 'src/'"),
+    counts: Optional[List[str]] = typer.Option(None, help="Function prefixes to count"),
+    output: Optional[Path] = typer.Option(None, help="Output Excel file path"),
+    debug: Optional[bool] = typer.Option(False, help="Enable verbose output")
+):
+    """
+    Analyze function usage from GitHub repos and save results to Excel.
+    CLI options override config values.
+    """
+    config = {}
+    if config_path and config_path.exists():
+        config = json.loads(config_path.read_text())
+
+    final_repos = repos or config.get("repos")
+    final_folder = folder or config.get("folder", "src/")
+    final_counts = counts or config.get("counts", [])
+    final_output = Path(output or config.get("output", "function_usage.xlsx"))
+    final_debug = debug if debug is not None else config.get("debug", False)
+
+    if not final_repos or not final_counts:
+        typer.secho("repos and counts are required (via CLI or config)", fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+    repo_dfs = {}
+
+    for repo in final_repos:
+        local_path = clone_repo(repo)
+        df = analyze_repo(local_path / final_folder, tuple(final_counts), debug=final_debug)
+        repo_dfs[repo] = df
+
+    save_repo_dataframes_to_excel(repo_dfs, output_path=final_output)
+
+
+# ─────────────────────────────────────────────────────────────
+# __main__ (entry point)
+# ─────────────────────────────────────────────────────────────
+"""
+Entry point for command-line execution.
+
+Enables `python script.py count-usage` execution style.
+"""
+
+if __name__ == "__main__":
+    app()
