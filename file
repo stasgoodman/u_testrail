@@ -1,0 +1,10 @@
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+def fast_repo_scan(folder: Path, targets: set) -> pd.DataFrame:
+    files = list(folder.rglob("*.py"))
+    
+    with ThreadPoolExecutor() as pool:
+        dfs = list(pool.map(lambda f: analyze_python_file(f, targets), files))
+
+    return pd.concat([df for df in dfs if not df.empty], ignore_index=True)
